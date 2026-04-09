@@ -22,7 +22,7 @@ class TemplateType(object):
 class RobotGeometry(object):
     def __init__(self):
         self.length = 0.45
-        self.width = 0.39
+        self.width = 0.41
         self.half_length = self.length / 2.0
         self.half_width = self.width / 2.0
         self.radius = math.hypot(self.half_length, self.half_width)
@@ -53,8 +53,7 @@ class MotionTube(object):
 
 class GoalOrientedMotionTubePlanner(object):
     def __init__(self):
-        rospy.init_node("goal_oriented_motion_tube_planner_v25", anonymous=True)
-        rospy.logwarn("DEBUG: fixed_granular_v25.py loaded – BARN stable + smarter recovery")
+        rospy.init_node("goal_oriented_motion_tube_planner_fusion", anonymous=True)
 
         self.latest_scan = None
         self.current_pose = None
@@ -109,8 +108,8 @@ class GoalOrientedMotionTubePlanner(object):
 
         # pruning
         self.arc_len_merge_tol = float(rospy.get_param("~arc_len_merge_tol", 0.15))
-        self.short_arc_threshold = float(rospy.get_param("~short_arc_threshold", 0.50))
-        self.short_tube_keep_per_side = int(rospy.get_param("~short_tube_keep_per_side", 5))
+        self.short_arc_threshold = float(rospy.get_param("~short_arc_threshold", 0.84))
+        self.short_tube_keep_per_side = int(rospy.get_param("~short_tube_keep_per_side", 8))
 
         # clearance
         self.w_clearance = float(rospy.get_param("~w_clearance", 10.0))
@@ -120,9 +119,15 @@ class GoalOrientedMotionTubePlanner(object):
         self.long_tube_rel_ratio = float(rospy.get_param("~long_tube_rel_ratio", 0.75))
         
         # centering / lateral clearance
-        self.w_center_balance = float(rospy.get_param("~w_center_balance", 6.0))
+        self.w_center_balance = float(rospy.get_param("~w_center_balance", 10.0))
         self.w_side_clearance = float(rospy.get_param("~w_side_clearance", 8.0))
         self.side_clearance_safe_dist = float(rospy.get_param("~side_clearance_safe_dist", 0.14))
+        # fusion: adaptive long-tube gate, but more conservative than upgrade_1
+        self.tight_space_threshold_1 = float(rospy.get_param("~tight_space_threshold_1", 0.60))
+        self.tight_space_threshold_2 = float(rospy.get_param("~tight_space_threshold_2", 1.10))
+        self.tight_rel_ratio_1 = float(rospy.get_param("~tight_rel_ratio_1", 0.45))
+        self.tight_rel_ratio_2 = float(rospy.get_param("~tight_rel_ratio_2", 0.60))
+        self.tight_short_arc_bonus = float(rospy.get_param("~tight_short_arc_bonus", 1.20))
 
         # recovery basic
         self.recovery_backup_dist = float(rospy.get_param("~recovery_backup_dist", 0.20))
@@ -1250,10 +1255,13 @@ class GoalOrientedMotionTubePlanner(object):
         return max(0.0, prog)
 
     def composite_cost(self, t, goal_bearing, goal_factor=1.0):
-        w_progress = 14.0
-        w_heading = 5.0
+        # Fusion strategy:
+        # - keep A's stronger goal / heading / length preference in normal-open space
+        # - allow B's short-turn flexibility only when frontal clearance is tight
+        w_progress = 12.0
+        w_heading = 4.5
         w_curvature = 0.8
-        w_length = 2.0    #0.15
+        w_length = 1.2
         w_speed = 0.8
         w_clearance = self.w_clearance
 
@@ -1264,10 +1272,7 @@ class GoalOrientedMotionTubePlanner(object):
         c += goal_factor * w_heading * heading_err
 
         c += w_curvature * abs(t.w)
-
-        # reward longer tubes instead of penalizing them
         c -= w_length * t.arc_len
-
         c -= w_speed * t.v
 
         if t.min_clearance < self.clearance_safe_dist:
@@ -1287,6 +1292,13 @@ class GoalOrientedMotionTubePlanner(object):
             c += self.w_side_clearance * side_ratio
 
         c += self.w_center_balance * min(0.25, t.center_balance)
+
+        # Tight-space exception from version B, but weaker to avoid over-favoring short tubes.
+        fwd = self._fwd_cache
+        if fwd < self.tight_space_threshold_1:
+            c -= 0.05 * t.arc_len
+            if t.arc_len < 0.5 and heading_err < math.radians(28.0):
+                c -= self.tight_short_arc_bonus
 
         return c
 
@@ -1350,14 +1362,21 @@ class GoalOrientedMotionTubePlanner(object):
         return abs(d - self.wall_follow_ref_dist)
 
     def _filter_longest_available_tubes(self, feasible_tubes, rel_ratio=None):
-        if rel_ratio is None:
-            rel_ratio = self.long_tube_rel_ratio
         if not feasible_tubes:
             return []
 
+        if rel_ratio is None:
+            fwd = self._fwd_cache
+            if fwd < self.tight_space_threshold_1:
+                rel_ratio = self.tight_rel_ratio_1
+            elif fwd < self.tight_space_threshold_2:
+                rel_ratio = self.tight_rel_ratio_2
+            else:
+                rel_ratio = self.long_tube_rel_ratio
+
         max_len = max(t.arc_len for t in feasible_tubes)
         return [t for t in feasible_tubes if t.arc_len >= rel_ratio * max_len]
-        
+
     # --------------------- selection & command ---------------------
     def select_best_tube(self):
         feas = [t for t in self.motion_tubes if t.is_feasible]
@@ -1370,21 +1389,27 @@ class GoalOrientedMotionTubePlanner(object):
             )
             return
 
-        # Keep only the longest available group.
-        # Short tubes are only considered when longer ones are blocked.
-        long_feas = self._filter_longest_available_tubes(
-            feas, rel_ratio=self.long_tube_rel_ratio
-        )
+        fwd = self._fwd_cache
+        if fwd < self.tight_space_threshold_1:
+            rel_ratio = self.tight_rel_ratio_1
+        elif fwd < self.tight_space_threshold_2:
+            rel_ratio = self.tight_rel_ratio_2
+        else:
+            rel_ratio = self.long_tube_rel_ratio
 
-        self.selected_tube = min(long_feas, key=lambda z: z.cost)
+        filtered = self._filter_longest_available_tubes(feas, rel_ratio=rel_ratio)
+        candidate_set = filtered if filtered else feas
+        self.selected_tube = min(candidate_set, key=lambda z: z.cost)
 
         rospy.loginfo_throttle(
             1.0,
-            "Selected long-priority tube: arc_len=%.2f cost=%.3f (%d long-group / %d feasible)",
+            "Selected fusion tube: arc_len=%.2f cost=%.3f (ratio=%.2f, %d filtered / %d feasible, fwd=%.2f)",
             self.selected_tube.arc_len,
             self.selected_tube.cost,
-            len(long_feas),
+            rel_ratio,
+            len(candidate_set),
             len(feas),
+            fwd,
         )
 
     def publish_commands(self):
@@ -1397,10 +1422,16 @@ class GoalOrientedMotionTubePlanner(object):
             if abs(w) < self.deadband_w:
                 w = 0.0
 
-            if self.use_fwd_slowdown and self.fwd_slow_gain > 1e-6:
+            if self.use_fwd_slowdown:
                 fwd = self._fwd_cache
-                scale = max(self.min_forward_scale, min(1.0, fwd / (1.0 + 1e-6)))
-                v *= scale ** (1.0 + self.fwd_slow_gain)
+                if fwd < self.tight_space_threshold_1:
+                    # In very tight space, keep version A's stronger slowdown for robustness.
+                    scale = max(self.min_forward_scale, min(1.0, fwd / (1.0 + 1e-6)))
+                    v *= scale ** (1.0 + self.fwd_slow_gain)
+                elif fwd < 1.5:
+                    # In moderate space, keep version B's milder slowdown to preserve speed.
+                    scale = max(self.min_forward_scale, min(1.0, fwd / 1.5))
+                    v *= scale
 
             if self.selected_tube.min_clearance < 0.12:
                 v *= 0.75
